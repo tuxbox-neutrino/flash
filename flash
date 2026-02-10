@@ -1,261 +1,563 @@
 #!/bin/sh
-#set -x
+set -eu
 
-# use common image info version file, shared with stb-flash.lua for the same setup
-FLASH_VERSION_FILE="/etc/image-version"
+FLASH_VERSION_FILE="${FLASH_VERSION_FILE:-/etc/image-version}"
+FLASH_PROFILE_FILE="${FLASH_PROFILE_FILE:-/etc/tuxbox/flash-machine-profile.conf}"
+FLASH_ICON_DIR="${FLASH_ICON_DIR:-/usr/share/tuxbox/neutrino/icons}"
+FLASH_DEV_BASE="${FLASH_DEV_BASE:-/dev/disk/by-partlabel}"
+FLASH_DESTINATION_BASE="${FLASH_DESTINATION_BASE:-/mnt/userdata}"
+FLASH_DISPLAY_DEVICE="${FLASH_DISPLAY_DEVICE:-/dev/dbox/oled0}"
+FLASH_PROC_MOUNTS_FILE="${FLASH_PROC_MOUNTS_FILE:-/proc/mounts}"
+FLASH_PROC_CMDLINE_FILE="${FLASH_PROC_CMDLINE_FILE:-/proc/cmdline}"
+FLASH_NEUTRINO_CONF="${FLASH_NEUTRINO_CONF:-/etc/neutrino/config/neutrino.conf}"
+FLASH_AVS_INPUT_PATH="${FLASH_AVS_INPUT_PATH:-/proc/stb/avs/0/input}"
+FLASH_TMP_BASE="${FLASH_TMP_BASE:-/tmp/.flash}"
+FLASH_MIN_FREE_KB="${FLASH_MIN_FREE_KB:-257016}"
+FLASH_MOUNT_CANDIDATES="${FLASH_MOUNT_CANDIDATES:-/media/usb /media/USB /media/hdd /media/Generic-}"
 
-# return string from config file
-# parameter 1 key name
-# parameter 2 default value
-get_config_string() {
-	KEY=$1
-	VAL=$2
-	if test ! -f $FLASH_VERSION_FILE; then
-		echo "$0 - $FLASH_VERSION_FILE not found!"
-		exit 1
-	fi
+FLASH_CURL_BIN="${FLASH_CURL_BIN:-curl}"
+FLASH_UNZIP_BIN="${FLASH_UNZIP_BIN:-unzip}"
+FLASH_SYSTEMCTL_BIN="${FLASH_SYSTEMCTL_BIN:-systemctl}"
+FLASH_PIDOF_BIN="${FLASH_PIDOF_BIN:-pidof}"
+FLASH_PV_BIN="${FLASH_PV_BIN:-pv}"
 
-	RET_TMP="$(cat $FLASH_VERSION_FILE | grep "$KEY=")"
-	RET=`echo "$RET_TMP" | sed 's/'"$KEY"'=//g'`
+NO_UPDATE_AVAILABLE=0
+NEUTRINO_STOPPED=0
+TARGET_SLOT=""
+CURRENT_ROOT_SLOT=""
+CURRENT_ROOT_DEVICE=""
+CURRENT_ROOT_DEVICE_REAL=""
+TARGET_ROOT_DEVICE_REAL=""
+LAYOUT_MODE=""
 
-	if [ "$RET" = "" ]; then
-		RET=$VAL
-	fi
+if [ -f "${FLASH_PROFILE_FILE}" ]; then
+	# shellcheck disable=SC1090
+	. "${FLASH_PROFILE_FILE}"
+fi
 
-	echo $RET
+print_usage() {
+	cat <<'EOF'
+Usage: flash <slot> [<image-dir>|restore|force]
+
+Arguments:
+  slot       destination partition number [1-4]
+  image-dir  absolute path to unpacked image directory or parent directory
+  restore    use default backup path (.../service/image/backup/partition_<slot>)
+  force      force download from update feed
+
+Examples:
+  flash 2
+  flash 2 force
+  flash 2 restore
+  flash 2 /media/usb/service/image
+  flash 2 /media/usb/service/image/hd51
+EOF
 }
 
-# set basic variables from settings
-# get update url from config file
-IMAGE_UPDATE_URL=`get_config_string "image_update_url" "file:///media/sda1/service/images"`
+cmd_exists() {
+	command -v "$1" >/dev/null 2>&1
+}
 
-# get info filename from config file
-INFO_FILE_NAME=`get_config_string "image_update_info_file" "imageversion"`
+info() {
+	printf '%s\n' "$*"
+}
 
-# get image name from from image-version file
-IMAGE_NAME=`get_config_string "imagename" "neutrino-image"`
+warn() {
+	printf 'WARN: %s\n' "$*" >&2
+}
 
-# get machine from image-version file
-MACHINE=`get_config_string "machine" ""`
-if [ "$MACHINE" == "" ]; then
-	echo "$0 - no machine defined! Please check key <machine> within $FLASH_VERSION_FILE"
+run_systemctl() {
+	if cmd_exists "${FLASH_SYSTEMCTL_BIN}"; then
+		"${FLASH_SYSTEMCTL_BIN}" "$@" >/dev/null 2>&1 || true
+	fi
+}
+
+display_text() {
+	msg="$1"
+	if [ -n "${FLASH_DISPLAY_DEVICE}" ] && [ -e "${FLASH_DISPLAY_DEVICE}" ] && [ -w "${FLASH_DISPLAY_DEVICE}" ]; then
+		printf '%s\n' "${msg}" > "${FLASH_DISPLAY_DEVICE}" || true
+	fi
+}
+
+start_neutrino() {
+	run_systemctl start neutrino
+}
+
+stop_neutrino() {
+	if cmd_exists "${FLASH_PIDOF_BIN}" && "${FLASH_PIDOF_BIN}" neutrino >/dev/null 2>&1; then
+		run_systemctl stop neutrino
+		NEUTRINO_STOPPED=1
+	fi
+}
+
+fail() {
+	printf 'ERROR: %s\n' "$*" >&2
+	display_text "Flash failed"
+	if [ "${NEUTRINO_STOPPED}" = "1" ]; then
+		start_neutrino
+	fi
 	exit 1
-fi
-
-# get image flash file name
-IMAGE_FILE_NAME=`get_config_string "image_file_name " $IMAGE_NAME"_"$MACHINE"_ofgwrite.zip"`
-IMAGE_SOURCE="$IMAGE_UPDATE_URL/$IMAGE_FILE_NAME"
-IMAGE_VERSION_ONLINE="$IMAGE_UPDATE_URL/$INFO_FILE_NAME"
-
-# screen background
-PICTURE_SOURCE="/usr/share/tuxbox/neutrino/icons"
-
-ROOTFS="rootfs.tar.bz2"
-KERNEL_BIN="kernel.bin"
-ROOT_BASE="linuxrootfs"
-KERNEL_BASE="linuxkernel"
-
-DESTINATION="/mnt/userdata"
-
-DEV_BASE="/dev/disk/by-partlabel"
-DEV_DISPLAY="/dev/dbox/oled0"
-
-# define work directory
-TMPDIR="/tmp/.`basename $0`"
-
-# ensure empty .flash directory, only for save 
-rm -rf "$TMPDIR"
-
-# set /tmp as default working directory
-HDD_MOUNT="$TMPDIR"
-
-# set possible removable mounted drives
-DRIVES="/media/usb /media/USB /media/hdd /media/Generic-"
-
-# check for mounted drives, if one of their available then use this as working directory
-for D in  $DRIVES ; do
-	DRIVE=`cat /proc/mounts | grep  "$D"`
-	if [ "$DRIVE" != "" ]; then
-		HDD_MOUNT="$D"
-		echo $HDD_MOUNT
-		break
-	fi
-done
-IMAGE_BASE="$HDD_MOUNT/service/image"
-
-
-# get current root partition
-ROOT_PART_CURRENT="$(sed -e 's/^.*rootsubdir=//' -e 's/ .*$//' < /proc/cmdline | grep -o '[1-4]')"
-
-# get current osd resolution settings from neutrino configuration
-# 0=1280x720
-# 1=1920x1080
-RES_SETTING="$(cat /etc/neutrino/config/neutrino.conf | grep osd_resolution | grep -o '[0-1]')"
-RESOLUTION="1920x1080"
-[ "$RES_SETTING" = '0' ] && RESOLUTION="1280x720"
-
-# get pid of neutrino and stop neutrino
-pidof neutrino >> /dev/null && systemctl stop neutrino
-
-# set output
-echo encoder > /proc/stb/avs/0/input
-
-clear
-
-# show download screen
-which convert >> /dev/null && convert -resize "$RESOLUTION" -gravity center -extent "$RESOLUTION" "$PICTURE_SOURCE"/update_download.jpg bgra:/dev/fb0
-
-exit_done() {
-    # cleanup work directory
-    rm -rf "$TMPDIR"
-    STR_REBOOT="...Reboot"
-    STR_START_NEUTRINO="...Restart"
-
-    if [[ "$NO_UPDATE_AVAILABLE" = '1' ]];then
-        printf '\n\033[32m%s\n\033[0m' "No update available"
-        pidof neutrino >> /dev/null || systemctl start neutrino
-        exit 0;
-    elif [ "$ROOT_PART_CURRENT" = "$PART" ];then
-        clear
-        which convert >> /dev/null && convert -resize "$RESOLUTION" -gravity center -extent "$RESOLUTION" "$PICTURE_SOURCE"/update_done.jpg bgra:/dev/fb0
-        which git >> /dev/null && cd /etc && git reset --hard >> /dev/null
-        echo "$STR_REBOOT"
-        echo "$STR_REBOOT" > "$DEV_DISPLAY" && systemctl reboot
-        exit 0;
-    else
-        which convert >> /dev/null && convert -resize "$RESOLUTION" -gravity center -extent "$RESOLUTION" "$PICTURE_SOURCE"/update_done.jpg bgra:/dev/fb0
-        echo "$STR_START_NEUTRINO"
-	echo "$STR_START_NEUTRINO" > "$DEV_DISPLAY"
-        sleep 3
-        clear
-        pidof neutrino >> /dev/null || systemctl start neutrino
-        exit 0;
-    fi
 }
 
-[[ "$*" = '-h' ]] || [[ "$*" = '--help' ]] &&  { printf '\n%s\n' "Give the destination partition number [1 - 4] as first argument.
-As second argument you can specify the path where the image is stored.
-If no second argument is given the image will be downloaded from
-"$IMAGE_SOURCE"
-" && exit 0;}
-
-if [ "$1" -lt 1 ] || [ "$1" -gt 4 ]; then
-    { printf '\n\033[31m%s\n' "Choose a valid partition [1-4]" ; exit 1;}
-fi
-
-if [ "$1" = 1 ]; then
-    PART=1; APPEND=""
-elif [ "$1" = 2 ]; then
-    PART=2; APPEND="$PART"
-elif [ "$1" = 3 ]; then
-    PART=3; APPEND="$PART"
-elif [ "$1" = 4 ]; then
-    PART=4; APPEND="$PART"
-fi
-
-IMAGE_VERSION_LOCAL="$IMAGE_BASE/imageversion_partition_$PART"
-
-[ -z "$2" ] ||  echo "$2" | grep "/" >> /dev/null || [ "$2" = 'restore' ] || [ "$2" = 'force' ] || { printf '\n\033[31m%s\n' "Please choose a valid path" && exit 9; }
-
-function write_image () {
-set -x
-	IMAGE_DIR=`find $IMAGE_BASE  -type d -name  $MACHINE`
-	
-	if test ! -f "$IMAGE_DIR"/"$KERNEL_BIN"; then
-		NO_KERNEL_IMAGE_FOUND="Flash failed, $IMAGE_DIR/$KERNEL_BIN not found"
-		printf '\n\033[31m%s\n' "$NO_KERNEL_IMAGE_FOUND"
-		echo "$FAIL_NO_KERNEL_IMAGE_FOUND" > "$DEV_DISPLAY"
-		exit_done;
-	fi
-
-	if test ! -f "$IMAGE_DIR"/"$ROOTFS"; then
-		NO_ROOTFS_IMAGE_FOUND="Flash failed, $IMAGE_DIR/$ROOTFS not found"
-		printf '\n\033[31m%s\n' "$NO_ROOTFS_IMAGE_FOUND"
-		echo "$NO_ROOTFS_IMAGE_FOUND" > "$DEV_DISPLAY"
-		exit_done;
-	fi
-
-	WRITE_IMAGE_INTO_PART="Writing image into partition $PART"
-	printf '\n\n\033[1m%s\n\033[0m' "$WRITE_IMAGE_INTO_PART"
-	echo "$WRITE_IMAGE_INTO_PART" > "$DEV_DISPLAY"
-
-	which convert >> /dev/null && convert -resize "$RESOLUTION" -gravity center -extent "$RESOLUTION" "$PICTURE_SOURCE"/update_kernel.jpg bgra:/dev/fb0
-
-	printf '\n\033[33m%s\033[37m%s\n' "Writing kernel into $DEV_BASE/$KERNEL_BASE$APPEND"
-	pv -w 100 < "$IMAGE_DIR"/"$KERNEL_BIN" > "$DEV_BASE"/"$KERNEL_BASE$APPEND"
-	[ "$ROOT_PART_CURRENT" = "$PART" ] || rm -rf "$DESTINATION"/"$ROOT_BASE$PART"/*
-
-	which convert >> /dev/null && convert -resize "$RESOLUTION" -gravity center -extent "$RESOLUTION" "$PICTURE_SOURCE"/update_rootfs.jpg bgra:/dev/fb0
-
-	printf '\n\033[33m%s\033[37m%s\n' "Writing rootfs into $DESTINATION/$ROOT_BASE$PART"
-	mkdir -p "$DESTINATION"/"$ROOT_BASE$PART"
-	pv "$IMAGE_DIR"/"$ROOTFS" -w 100 | tar -xjf - -C "$DESTINATION"/"$ROOT_BASE$PART"
-
-	FLASH_SUCCESS="Flash succeeded"
-	printf '\n\033[1m\033[32m%s\033[0m\n' "$FLASH_SUCCESS"; printf '\033[1m\033[0m'
-	echo "$FLASH_SUCCESS" > "$DEV_DISPLAY"
-
-	exit_done
+trim_leading_slash() {
+	value="$1"
+	value="${value#/}"
+	printf '%s\n' "${value}"
 }
 
-case "$2" in
-    restore)
-        IMAGE_BASE="$IMAGE_BASE/backup/partition_$PART"
-        ;;
-    /*)
-        IMAGE_BASE="$2"
-        ;;
+image_kv_get() {
+	key="$1"
+	default_value="$2"
+
+	if [ ! -f "${FLASH_VERSION_FILE}" ]; then
+		printf '%s\n' "${default_value}"
+		return 0
+	fi
+
+	value="$(awk -F= -v k="${key}" '$1 == k { sub("^[^=]*=", "", $0); print; exit }' "${FLASH_VERSION_FILE}")"
+	if [ -n "${value}" ]; then
+		printf '%s\n' "${value}"
+	else
+		printf '%s\n' "${default_value}"
+	fi
+}
+
+image_kv_first() {
+	default_value="$1"
+	shift
+	for key in "$@"; do
+		value="$(image_kv_get "${key}" "")"
+		if [ -n "${value}" ]; then
+			printf '%s\n' "${value}"
+			return 0
+		fi
+	done
+	printf '%s\n' "${default_value}"
+}
+
+cmdline_get() {
+	key="$1"
+	if [ ! -f "${FLASH_PROC_CMDLINE_FILE}" ]; then
+		printf '\n'
+		return 0
+	fi
+
+	awk -v k="${key}" '
+	{
+		for (i = 1; i <= NF; i++) {
+			split($i, kv, "=")
+			if (kv[1] == k) {
+				print kv[2]
+				exit
+			}
+		}
+	}
+	' "${FLASH_PROC_CMDLINE_FILE}"
+}
+
+normalize_dev_path() {
+	path="$1"
+	if [ -z "${path}" ]; then
+		printf '\n'
+		return 0
+	fi
+	if [ -e "${path}" ]; then
+		readlink -f "${path}" 2>/dev/null || printf '%s\n' "${path}"
+	else
+		printf '%s\n' "${path}"
+	fi
+}
+
+detect_current_root_slot() {
+	slot="$(cmdline_get rootsubdir | tr -cd '0-9' | cut -c1)"
+	case "${slot}" in
+		1|2|3|4)
+			printf '%s\n' "${slot}"
+			return 0
+			;;
+	esac
+
+	root_dev="$(cmdline_get root)"
+	case "${root_dev}" in
+		*rootfs1*|*linuxrootfs1*) printf '1\n' ;;
+		*rootfs2*|*linuxrootfs2*) printf '2\n' ;;
+		*rootfs3*|*linuxrootfs3*) printf '3\n' ;;
+		*rootfs4*|*linuxrootfs4*) printf '4\n' ;;
+		*) printf '\n' ;;
+	esac
+}
+
+detect_resolution() {
+	if [ -f "${FLASH_NEUTRINO_CONF}" ] && grep -Eq '(^|[[:space:]])osd_resolution=0($|[[:space:]])' "${FLASH_NEUTRINO_CONF}"; then
+		printf '1280x720\n'
+	else
+		printf '1920x1080\n'
+	fi
+}
+
+show_picture() {
+	name="$1"
+	if cmd_exists convert && [ -f "${FLASH_ICON_DIR}/${name}" ]; then
+		convert -resize "${RESOLUTION}" -gravity center -extent "${RESOLUTION}" "${FLASH_ICON_DIR}/${name}" bgra:/dev/fb0 || true
+	fi
+}
+
+stream_to_file() {
+	src="$1"
+	dst="$2"
+	if cmd_exists "${FLASH_PV_BIN}"; then
+		"${FLASH_PV_BIN}" -w 100 < "${src}" > "${dst}"
+	else
+		cat "${src}" > "${dst}"
+	fi
+}
+
+extract_rootfs() {
+	src="$1"
+	dst="$2"
+	if cmd_exists "${FLASH_PV_BIN}"; then
+		"${FLASH_PV_BIN}" "${src}" -w 100 | tar -xjf - -C "${dst}"
+	else
+		tar -xjf "${src}" -C "${dst}"
+	fi
+}
+
+detect_default_image_base() {
+	work_root="${FLASH_TMP_BASE}"
+	mount_root="${work_root}"
+	mkdir -p "${work_root}"
+
+	if [ -f "${FLASH_PROC_MOUNTS_FILE}" ]; then
+		for candidate in ${FLASH_MOUNT_CANDIDATES}; do
+			if grep -q " ${candidate} " "${FLASH_PROC_MOUNTS_FILE}" 2>/dev/null; then
+				mount_root="${candidate}"
+				break
+			fi
+		done
+	fi
+
+	printf '%s\n' "${mount_root}/service/image"
+}
+
+validate_slot() {
+	slot="$1"
+	case "${slot}" in
+		1|2|3|4) ;;
+		*) fail "choose a valid partition [1-4]" ;;
+	esac
+}
+
+get_free_space_kb() {
+	path="$1"
+	df -Pk "${path}" 2>/dev/null | awk 'NR == 2 { print $4 }'
+}
+
+find_existing_file() {
+	dir="$1"
+	shift
+	for raw_name in "$@"; do
+		[ -n "${raw_name}" ] || continue
+		name="$(trim_leading_slash "${raw_name}")"
+		[ -n "${name}" ] || continue
+		if [ -f "${dir}/${name}" ]; then
+			printf '%s\n' "${name}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+find_kernel_file() {
+	dir="$1"
+	expected="$2"
+
+	found="$(find_existing_file "${dir}" "${expected}" "kernel.bin" "uImage" "kernel_auto.bin" "kernel_cfe_auto.bin" || true)"
+	if [ -n "${found}" ]; then
+		printf '%s\n' "${found}"
+		return 0
+	fi
+
+	for wildcard in "${dir}"/*kernel*.bin; do
+		if [ -f "${wildcard}" ]; then
+			basename "${wildcard}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+find_rootfs_file() {
+	dir="$1"
+	expected="$2"
+	find_existing_file "${dir}" "${expected}" "rootfs.tar.bz2" "rootfs-one.tar.bz2" "rootfs-two.tar.bz2"
+}
+
+resolve_image_payload() {
+	base_dir="$1"
+	machine="$2"
+	kernel_pref="$3"
+	rootfs_pref="$4"
+
+	for candidate in "${base_dir}" "${base_dir}/${machine}"; do
+		[ -d "${candidate}" ] || continue
+		kernel_file="$(find_kernel_file "${candidate}" "${kernel_pref}" || true)"
+		rootfs_file="$(find_rootfs_file "${candidate}" "${rootfs_pref}" || true)"
+		if [ -n "${kernel_file}" ] && [ -n "${rootfs_file}" ]; then
+			IMAGE_DIR="${candidate}"
+			KERNEL_IMAGE_FILE="${kernel_file}"
+			ROOTFS_IMAGE_FILE="${rootfs_file}"
+			return 0
+		fi
+	done
+
+	fail "no valid image payload found below ${base_dir} (machine: ${machine})"
+}
+
+select_layout_mode() {
+	slot="$1"
+	append=""
+	[ "${slot}" = "1" ] || append="${slot}"
+
+	if [ -n "${FLASH_SCRIPT_LAYOUT:-}" ]; then
+		printf '%s\n' "${FLASH_SCRIPT_LAYOUT}"
+		return 0
+	fi
+
+	kernel_label_base="${FLASH_KERNEL_LABEL_BASE:-linuxkernel}"
+	if [ -e "${FLASH_DEV_BASE}/${kernel_label_base}${append}" ]; then
+		printf 'linuxrootfs\n'
+		return 0
+	fi
+	if [ -e "${FLASH_DEV_BASE}/kernel${slot}" ] || [ -e "${FLASH_DEV_BASE}/kernel${append}" ]; then
+		printf 'rootfs\n'
+		return 0
+	fi
+
+	printf 'linuxrootfs\n'
+}
+
+configure_targets() {
+	slot="$1"
+	append=""
+	[ "${slot}" = "1" ] || append="${slot}"
+
+	LAYOUT_MODE="$(select_layout_mode "${slot}")"
+
+	case "${LAYOUT_MODE}" in
+		linuxrootfs)
+			kernel_label_base="${FLASH_KERNEL_LABEL_BASE:-linuxkernel}"
+			root_label_base="${FLASH_ROOT_LABEL_BASE:-linuxrootfs}"
+			root_target_base="${FLASH_ROOTFS_TARGET_BASE:-${FLASH_DESTINATION_BASE}/linuxrootfs}"
+			KERNEL_TARGET="${FLASH_DEV_BASE}/${kernel_label_base}${append}"
+			ROOTFS_TARGET="${root_target_base}${slot}"
+			ROOTFS_LABEL_TARGET="${FLASH_DEV_BASE}/${root_label_base}${slot}"
+			;;
+		rootfs)
+			if [ -e "${FLASH_DEV_BASE}/kernel${slot}" ]; then
+				KERNEL_TARGET="${FLASH_DEV_BASE}/kernel${slot}"
+			else
+				KERNEL_TARGET="${FLASH_DEV_BASE}/kernel${append}"
+			fi
+			root_target_base="${FLASH_ROOTFS_TARGET_BASE:-/mnt/rootfs}"
+			ROOTFS_TARGET="${root_target_base}${slot}"
+			ROOTFS_LABEL_TARGET="${FLASH_DEV_BASE}/rootfs${slot}"
+			;;
+		*)
+			fail "unsupported FLASH_SCRIPT_LAYOUT '${LAYOUT_MODE}'"
+			;;
+	esac
+
+	KERNEL_TARGET_REAL="$(normalize_dev_path "${KERNEL_TARGET}")"
+	if [ ! -e "${KERNEL_TARGET}" ] && [ ! -e "${KERNEL_TARGET_REAL}" ]; then
+		fail "kernel target not found for slot ${slot}: ${KERNEL_TARGET}"
+	fi
+
+	if [ -e "${ROOTFS_LABEL_TARGET}" ]; then
+		TARGET_ROOT_DEVICE_REAL="$(normalize_dev_path "${ROOTFS_LABEL_TARGET}")"
+	else
+		TARGET_ROOT_DEVICE_REAL=""
+	fi
+}
+
+is_target_current_root() {
+	if [ -n "${CURRENT_ROOT_SLOT}" ] && [ "${CURRENT_ROOT_SLOT}" = "${TARGET_SLOT}" ]; then
+		return 0
+	fi
+	if [ -n "${CURRENT_ROOT_DEVICE_REAL}" ] && [ -n "${TARGET_ROOT_DEVICE_REAL}" ] && [ "${CURRENT_ROOT_DEVICE_REAL}" = "${TARGET_ROOT_DEVICE_REAL}" ]; then
+		return 0
+	fi
+	return 1
+}
+
+finish_success() {
+	if [ "${NO_UPDATE_AVAILABLE}" = "1" ]; then
+		info "No update available"
+		display_text "No update available"
+		if [ "${NEUTRINO_STOPPED}" = "1" ]; then
+			start_neutrino
+		fi
+		exit 0
+	fi
+
+	show_picture update_done.jpg
+	if is_target_current_root; then
+		display_text "...Reboot"
+		run_systemctl reboot
+		exit 0
+	fi
+
+	display_text "...Restart"
+	sleep 3
+	clear >/dev/null 2>&1 || true
+	if [ "${NEUTRINO_STOPPED}" = "1" ]; then
+		start_neutrino
+	fi
+	exit 0
+}
+
+download_image_to_base() {
+	image_base="$1"
+	mode="$2"
+
+	cmd_exists "${FLASH_CURL_BIN}" || fail "required command not found: ${FLASH_CURL_BIN}"
+	cmd_exists "${FLASH_UNZIP_BIN}" || fail "required command not found: ${FLASH_UNZIP_BIN}"
+	cmd_exists md5sum || fail "required command not found: md5sum"
+
+	[ -d "${image_base}" ] || mkdir -p "${image_base}"
+
+	free_kb="$(get_free_space_kb "${image_base}")"
+	if [ -z "${free_kb}" ] || [ "${free_kb}" -lt "${FLASH_MIN_FREE_KB}" ]; then
+		fail "you need at least ${FLASH_MIN_FREE_KB} KB of free space on ${image_base}"
+	fi
+
+	image_version_local="${image_base}/imageversion_partition_${TARGET_SLOT}"
+	online_tmp="${image_base}/.imageversion_partition_${TARGET_SLOT}.online"
+
+	if [ "${mode}" = "check" ]; then
+		"${FLASH_CURL_BIN}" -fsSL "${IMAGE_VERSION_ONLINE}" -o "${online_tmp}" || fail "unable to fetch online imageversion: ${IMAGE_VERSION_ONLINE}"
+		[ -f "${image_version_local}" ] || : > "${image_version_local}"
+
+		md5_online="$(md5sum "${online_tmp}" | awk '{print $1}')"
+		md5_local="$(md5sum "${image_version_local}" | awk '{print $1}')"
+		if [ "${md5_online}" = "${md5_local}" ]; then
+			rm -f "${online_tmp}"
+			NO_UPDATE_AVAILABLE=1
+			finish_success
+		fi
+	fi
+
+	image_archive="${image_base}/${IMAGE_FILE_NAME}"
+	display_text "Downloading ${IMAGE_FILE_NAME}"
+	show_picture update_download.jpg
+	info "Downloading ${IMAGE_SOURCE}"
+	"${FLASH_CURL_BIN}" -fL "${IMAGE_SOURCE}" -o "${image_archive}" || fail "download failed: ${IMAGE_SOURCE}"
+
+	display_text "Decompressing"
+	show_picture update_decompress.jpg
+	"${FLASH_UNZIP_BIN}" -o "${image_archive}" -d "${image_base}" || fail "unpack failed: ${image_archive}"
+	rm -f "${image_archive}"
+
+	if [ -f "${online_tmp}" ]; then
+		mv -f "${online_tmp}" "${image_version_local}"
+	else
+		"${FLASH_CURL_BIN}" -fsSL "${IMAGE_VERSION_ONLINE}" -o "${image_version_local}" || true
+	fi
+}
+
+write_flash_payload() {
+	info "Writing image into partition ${TARGET_SLOT}"
+	display_text "Writing partition ${TARGET_SLOT}"
+
+	show_picture update_kernel.jpg
+	info "Writing kernel to ${KERNEL_TARGET_REAL}"
+	stream_to_file "${IMAGE_DIR}/${KERNEL_IMAGE_FILE}" "${KERNEL_TARGET_REAL}" || fail "kernel write failed"
+
+	if ! is_target_current_root; then
+		if [ -d "${ROOTFS_TARGET}" ]; then
+			rm -rf "${ROOTFS_TARGET:?}/"* || true
+		fi
+	fi
+	mkdir -p "${ROOTFS_TARGET}"
+
+	show_picture update_rootfs.jpg
+	info "Writing rootfs to ${ROOTFS_TARGET}"
+	extract_rootfs "${IMAGE_DIR}/${ROOTFS_IMAGE_FILE}" "${ROOTFS_TARGET}" || fail "rootfs extraction failed"
+}
+
+TARGET_SLOT="${1:-}"
+SOURCE_ARG="${2:-}"
+
+if [ -z "${TARGET_SLOT}" ] || [ "${TARGET_SLOT}" = "-h" ] || [ "${TARGET_SLOT}" = "--help" ]; then
+	print_usage
+	exit 0
+fi
+
+if [ "$#" -gt 2 ]; then
+	fail "too many arguments"
+fi
+
+validate_slot "${TARGET_SLOT}"
+
+case "${SOURCE_ARG}" in
+	""|restore|force|/*)
+		;;
+	*)
+		fail "invalid second argument '${SOURCE_ARG}' (expected: /abs/path, restore or force)"
+		;;
 esac
 
-IMAGE_DIR="$IMAGE_BASE/$MACHINE"
-IMAGE_FILE="$IMAGE_BASE/$IMAGE_FILE_NAME"
-IMAGE_VERSION="$IMAGE_DIR/imageversion"
-
-[ ! -d "$IMAGE_BASE" ] && mkdir -p "$IMAGE_BASE"
-
-SPACE_AVAILABLE="$(df -Pk $IMAGE_BASE | awk 'NR==2 {print $4}')"
-SPACE_NEEDED="You need at least 250MB of free space on $HDD_MOUNT"
-#[ "$SPACE_AVAILABLE" -lt 514032 ] && printf '\n\033[31m%s\n' "$SPACE_NEEDED" && exit_done
-[ "$SPACE_AVAILABLE" -lt 257016 ] && printf '\n\033[31m%s\n' "$SPACE_NEEDED" && exit_done
-
-if [ -z "$2" ]; then
-    [ ! -f "$IMAGE_VERSION_LOCAL" ] && touch "$IMAGE_VERSION_LOCAL"
-
-    MD5_IMAGE_VERSION_ONLINE=$(curl -s "$IMAGE_VERSION_ONLINE" | md5sum | awk '{print $1}')
-    MD5_IMAGE_VERSION_LOCAL=$(md5sum "$IMAGE_VERSION_LOCAL" | awk '{print $1}')
-
-    if [ "$MD5_IMAGE_VERSION_ONLINE" = "$MD5_IMAGE_VERSION_LOCAL" ]; then
-        echo "No update available" > "$DEV_DISPLAY"
-        NO_UPDATE_AVAILABLE="1"
-        exit_done;
-    fi
+if [ ! -f "${FLASH_VERSION_FILE}" ]; then
+	fail "${FLASH_VERSION_FILE} not found"
 fi
 
-if [ "$2" = 'force' ]; then
-    printf '\033[31m'
+MACHINE="${FLASH_MACHINE:-}"
+if [ -z "${MACHINE}" ]; then
+	MACHINE="$(image_kv_first "" machine box_model)"
 fi
+[ -n "${MACHINE}" ] || fail "no machine defined in ${FLASH_VERSION_FILE}"
 
-if [ -z "$2" ] || [ "$2" = 'force' ]; then
-    DECOMPRESSING="Downloading $IMAGE_FILE_NAME"
-    echo "$DECOMPRESSING" > "$DEV_DISPLAY"
+IMAGE_NAME="$(image_kv_first "neutrino-image" imagename image_name)"
+IMAGE_UPDATE_URL="$(image_kv_first "file:///media/sda1/service/images" image_update_url)"
+INFO_FILE_NAME="$(image_kv_first "imageversion" image_update_info_file)"
+DEFAULT_IMAGE_FILE="${IMAGE_NAME}_${MACHINE}_ofgwrite.zip"
+IMAGE_FILE_NAME="$(image_kv_first "${DEFAULT_IMAGE_FILE}" image_file_name)"
+IMAGE_SOURCE="${IMAGE_UPDATE_URL}/${IMAGE_FILE_NAME}"
+IMAGE_VERSION_ONLINE="${IMAGE_UPDATE_URL}/${INFO_FILE_NAME}"
 
-    printf '\n\033[1m%s\n\033[0m' "Downloading $IMAGE_SOURCE"
+EXPECTED_KERNEL_FILE="$(trim_leading_slash "${FLASH_KERNEL_FILE:-}")"
+EXPECTED_ROOTFS_FILE="$(trim_leading_slash "${FLASH_ROOTFS_FILE:-}")"
 
-    UNPACK="unzip -o -x $IMAGE_FILE -d $IMAGE_BASE"
+CURRENT_ROOT_SLOT="$(detect_current_root_slot)"
+CURRENT_ROOT_DEVICE="$(cmdline_get root)"
+CURRENT_ROOT_DEVICE_REAL="$(normalize_dev_path "${CURRENT_ROOT_DEVICE}")"
 
-    curl "$IMAGE_SOURCE" -o "$IMAGE_FILE" || exit_done
-    #[ -d "$IMAGE_DIR" ] && rm -r "$IMAGE_DIR"
-
-    echo "$DECOMPRESSING" > "$DEV_DISPLAY"
-    printf '\n\033[1m%s\n\033[0m' "$DECOMPRESSING"
-
-    which convert >> /dev/null && convert -resize "$RESOLUTION" -gravity center -extent "$RESOLUTION" "$PICTURE_SOURCE"/update_decompress.jpg bgra:/dev/fb0
-
-    $UNPACK || exit_done;
-
-    [ -f "$IMAGE_VERSION" ] && [ -d "$IMAGE_BASE" ] && cp -rf "$IMAGE_VERSION" "$IMAGE_VERSION_LOCAL"
-    [ -f "$IMAGE_FILE" ] && rm "$IMAGE_FILE"
+RESOLUTION="$(detect_resolution)"
+stop_neutrino
+if [ -w "${FLASH_AVS_INPUT_PATH}" ]; then
+	printf 'encoder\n' > "${FLASH_AVS_INPUT_PATH}" || true
 fi
+clear >/dev/null 2>&1 || true
 
-write_image
+configure_targets "${TARGET_SLOT}"
 
+DEFAULT_IMAGE_BASE="$(detect_default_image_base)"
+IMAGE_BASE="${DEFAULT_IMAGE_BASE}"
+
+case "${SOURCE_ARG}" in
+	restore)
+		IMAGE_BASE="${DEFAULT_IMAGE_BASE}/backup/partition_${TARGET_SLOT}"
+		;;
+	/*)
+		IMAGE_BASE="${SOURCE_ARG}"
+		;;
+	force)
+		download_image_to_base "${IMAGE_BASE}" "force"
+		;;
+	"")
+		download_image_to_base "${IMAGE_BASE}" "check"
+		;;
+esac
+
+resolve_image_payload "${IMAGE_BASE}" "${MACHINE}" "${EXPECTED_KERNEL_FILE}" "${EXPECTED_ROOTFS_FILE}"
+write_flash_payload
+finish_success
