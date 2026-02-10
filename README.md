@@ -2,6 +2,8 @@
 
 Single flash entrypoint used by Neutrino images.
 
+Deutsch: [README.de.md](README.de.md)
+
 The script is designed to be machine-data driven and to avoid per-machine
 branches where possible.
 
