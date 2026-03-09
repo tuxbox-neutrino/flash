@@ -29,6 +29,8 @@ CURRENT_ROOT_DEVICE=""
 CURRENT_ROOT_DEVICE_REAL=""
 TARGET_ROOT_DEVICE_REAL=""
 LAYOUT_MODE=""
+RUNTIME_TMP_DIR=""
+RUNTIME_TMP_CREATED=0
 
 if [ -f "${FLASH_PROFILE_FILE}" ]; then
 	# shellcheck disable=SC1090
@@ -88,6 +90,14 @@ stop_neutrino() {
 		run_systemctl stop neutrino
 		NEUTRINO_STOPPED=1
 	fi
+}
+
+cleanup_runtime_tmp() {
+	if [ "${RUNTIME_TMP_CREATED}" = "1" ] && [ -n "${RUNTIME_TMP_DIR}" ] && [ -d "${RUNTIME_TMP_DIR}" ]; then
+		rm -rf "${RUNTIME_TMP_DIR}" || true
+	fi
+	RUNTIME_TMP_CREATED=0
+	RUNTIME_TMP_DIR=""
 }
 
 fail() {
@@ -178,6 +188,8 @@ detect_current_root_slot() {
 	esac
 
 	root_dev="$(cmdline_get root)"
+	# Fallback heuristic: this works only for label-like root values
+	# (e.g. .../linuxrootfs2, .../rootfs3), not generic nodes like mmcblkXpY.
 	case "${root_dev}" in
 		*rootfs1*|*linuxrootfs1*) printf '1\n' ;;
 		*rootfs2*|*linuxrootfs2*) printf '2\n' ;;
@@ -223,9 +235,9 @@ extract_rootfs() {
 }
 
 detect_default_image_base() {
-	work_root="${FLASH_TMP_BASE}"
-	mount_root="${work_root}"
-	mkdir -p "${work_root}"
+	work_root="${FLASH_TMP_BASE%/}"
+	[ -n "${work_root}" ] || work_root="/tmp/.flash"
+	mount_root=""
 
 	if [ -f "${FLASH_PROC_MOUNTS_FILE}" ]; then
 		for candidate in ${FLASH_MOUNT_CANDIDATES}; do
@@ -236,7 +248,16 @@ detect_default_image_base() {
 		done
 	fi
 
-	printf '%s\n' "${mount_root}/service/image"
+	if [ -n "${mount_root}" ]; then
+		printf '%s\n' "${mount_root}/service/image"
+		return 0
+	fi
+
+	RUNTIME_TMP_DIR="${work_root}/run.$$"
+	mkdir -p "${RUNTIME_TMP_DIR}"
+	RUNTIME_TMP_CREATED=1
+
+	printf '%s\n' "${RUNTIME_TMP_DIR}/service/image"
 }
 
 validate_slot() {
@@ -483,6 +504,8 @@ write_flash_payload() {
 	info "Writing rootfs to ${ROOTFS_TARGET}"
 	extract_rootfs "${IMAGE_DIR}/${ROOTFS_IMAGE_FILE}" "${ROOTFS_TARGET}" || fail "rootfs extraction failed"
 }
+
+trap cleanup_runtime_tmp EXIT
 
 TARGET_SLOT="${1:-}"
 SOURCE_ARG="${2:-}"

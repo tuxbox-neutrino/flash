@@ -4,7 +4,7 @@ set -eu
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 FLASH_SCRIPT="${SCRIPT_DIR}/../flash"
 
-run_linuxrootfs_smoke() {
+run_linuxrootfs_smoke() (
 	tmpdir="$(mktemp -d /tmp/flash-script-smoke-a-XXXXXX)"
 	trap 'rm -rf "${tmpdir}"' EXIT INT HUP TERM
 
@@ -75,12 +75,9 @@ EOF
 
 	[ "$(cat "${tmpdir}/dev/disk/by-partlabel/linuxkernel2")" = "kernel-payload" ]
 	[ -f "${tmpdir}/mnt/userdata/linuxrootfs2/marker.txt" ]
+)
 
-	rm -rf "${tmpdir}"
-	trap - EXIT INT HUP TERM
-}
-
-run_rootfs_smoke() {
+run_rootfs_smoke() (
 	tmpdir="$(mktemp -d /tmp/flash-script-smoke-b-XXXXXX)"
 	trap 'rm -rf "${tmpdir}"' EXIT INT HUP TERM
 
@@ -153,10 +150,7 @@ EOF
 
 	[ "$(cat "${tmpdir}/dev/mmcblk1p2")" = "kernel-rootfs-layout" ]
 	[ -f "${tmpdir}/mnt/rootfs2/marker.txt" ]
-
-	rm -rf "${tmpdir}"
-	trap - EXIT INT HUP TERM
-}
+)
 
 sh -n "${FLASH_SCRIPT}"
 run_linuxrootfs_smoke
